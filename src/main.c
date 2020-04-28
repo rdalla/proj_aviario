@@ -24,6 +24,7 @@
 
 /* bibliotecas auxiliares */
 #include "dht11.h"
+#include "DHT22.h"
 
 /*log*/
 #include "esp_system.h"
@@ -32,30 +33,43 @@
 
 
 /*Definições*/
-#define DEBUG       1
-#define LED         2
+#define DEBUG          1
+#define AQUECEDOR      2
+#define UMIDIFICADOR   18
 
-#define ACENDE_LED()    gpio_set_level( LED, 1 )
-#define APAGA_LED()     gpio_set_level( LED, 0 )
+#define LIGA_AQUECEDOR()        gpio_set_level( AQUECEDOR, 1 )
+#define DESLIGA_AQUECEDOR()     gpio_set_level( AQUECEDOR, 0 )
+
+#define LIGA_UMIDIFICADOR()     gpio_set_level( UMIDIFICADOR, 1 )
+#define DESLIGA_UMIDIFICADOR()  gpio_set_level( UMIDIFICADOR, 0 )
 
 #define BUF_SIZE        (1024)
 
 /* definições para leitura de dados sensor DHT*/
 #define dhtDataPin GPIO_NUM_4
-#define sampleTime 1000
+#define sampleTime 2500
 
 /*handle do Semaforo*/
-SemaphoreHandle_t xMutex;
+SemaphoreHandle_t xMutex = 0;
+
+
+/*handle do Queue*/
+QueueHandle_t xMonitor_Serial = 0;
+QueueHandle_t xMonitor_Control = 0;
+QueueHandle_t xControl_Serial = 0;
+QueueHandle_t xSerial_Control = 0;
 
 
 /* Variáveis para Armazenar o handle da Task */
-TaskHandle_t xTaskRecSerial;
+TaskHandle_t xTaskComSerial;
+TaskHandle_t xTaskControl;
 
 /* timer handle */
 TimerHandle_t xTimer1;
 
 /* Protótipo das Tasks*/
-void vTaskRecSerial( void *pvParameter );
+void vTaskComSerial( void *pvParameter );
+void vTaskControl( void *pvParameter );
 void callBackTimer1( TimerHandle_t pxTimer );
 
 /* Funções auxiliares */
@@ -64,8 +78,8 @@ void vSetup(void);
 
 /* estrutura de dadOs para o sensor */
 typedef struct dht {
-    uint32_t temperature;
-    uint32_t humidity;
+    uint16_t temperature;
+    uint16_t humidity;
     int8_t status;
 } dht_t;
 
@@ -84,8 +98,20 @@ static int len = 0;
 /* Função Init Harware */
 void vInitHW(void)
 {
-    gpio_pad_select_gpio(LED );
-    gpio_set_direction(LED , GPIO_MODE_OUTPUT);
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_driver_install(UART_NUM_0, BUF_SIZE * 2, 0, 0, NULL, 0);
+
+    gpio_pad_select_gpio(AQUECEDOR );
+    gpio_set_direction(AQUECEDOR , GPIO_MODE_OUTPUT);
+    gpio_pad_select_gpio(UMIDIFICADOR );
+    gpio_set_direction(UMIDIFICADOR , GPIO_MODE_OUTPUT);
 }
 
 /* Função app_main*/
@@ -95,7 +121,7 @@ void app_main()
 
     while(true)
     {
-        vTaskDelay(pdMS_TO_TICKS(3000));    /* Delay de 3 segundos */
+        vTaskDelay(pdMS_TO_TICKS(10));    /* Delay de 3 segundos */
     }
 }
 
@@ -116,22 +142,36 @@ void vSetup(void)
     /* comando necessário pois o semáforo começa em zero */
     xSemaphoreGive( xMutex );
 
-    //criação de fila do callBackTimer1
-  	xMonitor = xQueueCreate( 10, sizeof( int ) );
-
-    if(xMonitor == NULL){
-  		ESP_LOGI("Erro na criação da Queue.\n");
+    //criação de fila do xSerialControl -- TaskControl
+  	xMonitor_Serial = xQueueCreate( 10, sizeof( int ) );
+    if(xMonitor_Serial == NULL)
+    {
+  		ESP_LOGI(TAG1, "Erro na criação da Queue.\n");
   	}
 
-    //criação de fila do Serial
-  	xSerial = xQueueCreate( 10, sizeof( int ) );
+    //criação de fila do xSerialControl -- TaskControl
+  	xMonitor_Control = xQueueCreate( 10, sizeof( int ) );
+    if(xMonitor_Control == NULL)
+    {
+  		ESP_LOGI(TAG1, "Erro na criação da Queue.\n");
+  	}
 
-    if(xSerial == NULL){
-  		ESP_LOGI("Erro na criação da Queue.\n");
+    //criação de fila do xSerialControl -- TaskControl
+  	xControl_Serial = xQueueCreate( 10, sizeof( int ) );
+    if(xControl_Serial == NULL)
+    {
+  		ESP_LOGI(TAG1, "Erro na criação da Queue.\n");
+  	}
+
+    //criação de fila do xSerialControl -- TaskControl
+  	xSerial_Control = xQueueCreate( 10, sizeof( int ) );
+    if(xSerial_Control == NULL)
+    {
+  		ESP_LOGI(TAG1, "Erro na criação da Queue.\n");
   	}
 
     //xTaskCreate(vPiscarLED,Nome da Task,Stack Size,parametro passado para a task,Prioridade da task,handle da task);
-    if( xTaskCreate( &vTaskRecSerial, "Task Rec Serial", 2048, NULL, 1, xTaskRecSerial )!= pdTRUE )
+    if( xTaskCreate( &vTaskComSerial, "Task Rec Serial", 4096, NULL, 1, xTaskComSerial )!= pdTRUE )
     {
         if( DEBUG )
         {
@@ -140,7 +180,7 @@ void vSetup(void)
         return;
     }
 
-    if( xTaskCreate( &vTaskControl, "TaskControl", 2048, NULL, 1, xTaskControl )!= pdTRUE )
+    if( xTaskCreate( &vTaskControl, "TaskControl", 4096, NULL, 2, xTaskControl )!= pdTRUE )
     {
         if( DEBUG )
         {
@@ -151,11 +191,13 @@ void vSetup(void)
 
     /* cria e testa auto-reload timer 1 */
     xTimer1 = xTimerCreate( "Timer1", pdMS_TO_TICKS(sampleTime), pdTRUE, 0, callBackTimer1 );
-    if( xTimer1 == NULL ) {
+    if( xTimer1 == NULL )
+    {
         ESP_LOGE( "Erro","Não foi possível criar o temporizador de amostragem (xTimer1 Auto-Reload)" );
         while(1);
     }
-    else {
+    else
+    {
         #if(DEBUG)
             ESP_LOGI( "Info","Temporizador de amostragem Criado" );
         #endif
@@ -165,151 +207,147 @@ void vSetup(void)
 
 }
 
-/* timer para amostragem cíclica de dados do sensor DHT11 */
+/*================================================================================*/
+/* timer para amostragem cíclica de dados do sensor DHT11 / DHT22 */
 void callBackTimer1( TimerHandle_t pxTimer ) {
 
     dht_t sensorSent;
 
     /* atribui pino de dados de entrada do sensor */
-    DHT11_init(dhtDataPin);
+    //DHT11_init(dhtDataPin);
+    setDHTgpio( GPIO_NUM_4 );
+
+    int ret = readDHT();
+		errorHandler(ret);
 
     /* leitura de dados do sensor dht */
-    sensorRead.temperature = DHT11_read().temperature;
-    sensorRead.humidity = DHT11_read().humidity;
-    sensorRead.status = DHT11_read().status;
+    sensorSent.temperature = (uint16_t)getTemperature();
+    sensorSent.humidity = (uint16_t)getHumidity();
+    //sensorSent.status = DHT11_read().status;
 
-    if(!xQueueSend(xMonitor, &sensorSent, 500)) {
-      ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
+    if(!xQueueSend(xMonitor_Serial, &sensorSent, 10))
+    {
+
     }
 
-    if(!xQueueSend(xSerial, &sensorSent, 500)) {
-      ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
+    if(!xQueueSend(xMonitor_Control, &sensorSent, 10))
+    {
+
     }
-
-/*    #if(DEBUG)
-
-        //exibe dados
-        printf( "Temperatura: %d\n", sensorRead.temperature );
-        printf( "Umidade: %d\n", sensorRead.humidity );
-        printf("Status: %d\n", sensorRead.status);
-
-      #endif
-
-
-*/
-
 }
 
-
+/*================================================================================*/
 /* Task de controle: Responsável por habilitar/desabilitar aquecedor e/ou umidificador */
 
 void vTaskControl( void *pvParameter )
 {
 
   dht_t sensorReceived; //struct local para receber valor da struct dht_t sensorSent
-  uint8_t setPoint[3];  //variavel local para receber da fila xSerial a temperatura ou umidade
+  uint8_t setPoint[2];  //variavel local para receber da fila xSerial a temperatura ou umidade
 
   uint8_t temp = 0;     //variavel local para receber setPoint temperatura
   uint8_t umid = 0;     //variavel local para receber setPoint umidade
 
+  while(true)
+  {
 
-
-
-
-  while(true){
-
-    if(!xQueueReceive(xSerial, &setPoint, 200)) {
-      ESP_LOGI("Falha ao receber o valor da fila dentro de 2500ms.\n");
-    }
-
-    if (!xQueueReceive(xMonitor, &sensorReceived, 2500)) {
-      ESP_LOGI("Falha ao receber o valor da fila dentro de 2500ms.\n");
-    }
-
-    switch (setPoint[0]) {
-
-      case 'T':
-        temp = atoi(setPoint[1]); //valor convertido de string para int
-        break;
-
-      case 'U':
-        umid = atoi(setPoint[1]); //valor convertido de string para int
-        break;
+    if(!xQueueReceive(xSerial_Control, &setPoint, 10))
+    {
 
     }
+    else
+    {
+        switch (setPoint[0])
+        {
+            case 'T':
+              temp = setPoint[1]; //valor convertido de string para int
+              break;
 
-    if (temp != 0) {
-      if (sensorReceived.temperature > temp) {
-          /*ligar GPIO Umidificador*/
-          //configurar GPIO
-          /*envia ON Umidificador : xQueueSend para a fila xSerial */
-          if(!xQueueSend(xSerial, "UON", 200)) {
-            ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
-          }
-
-      }
-      else {
-        /*desligar GPIO Umidificador*/
-        //configurar GPIO
-        /*envia OFF Umidificador : xQueueSend para a fila xSerial */
-        if(!xQueueSend(xSerial, "UOFF", 200)) {
-          ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
+            case 'U':
+              umid = setPoint[1]; //valor convertido de string para int
+              break;
         }
-      }
-
     }
 
-    if (umid != 0) {
-      if (sensorReceived.humidity > umid) {
-          /*ligar GPIO Aquecedor*/
-          //configurar GPIO
-          /*envia ON Aquecedor : xQueueSend para a fila xSerial */
-          if(!xQueueSend(xSerial, "AON", 200)) {
-            ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
-          }
-
-      }
-      else {
-        /*desligar GPIO Aquecedor*/
-        //configurar GPIO
-        /*envia OFF Aquecedor : xQueueSend para a fila xSerial */
-        if(!xQueueSend(xSerial, "AOFF", 200)) {
-          ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
-        }
-
-      }
+    if (!xQueueReceive(xMonitor_Control, &sensorReceived, 10))
+    {
 
     }
+    else
+    {
+        //if (temp != 0)
+        //{
+            if (sensorReceived.temperature < temp)
+            {
+                /*desligar GPIO Aquecedor*/
+                LIGA_AQUECEDOR();
 
+                /*envia ON Aquecedor : xQueueSend para a fila xSerial */
+                if(!xQueueSend(xControl_Serial, &"AON", 10))
+                {
+
+                }
+            }
+            else if (sensorReceived.temperature > temp)
+            {
+                /*ligar GPIO Aquecedor*/
+                DESLIGA_AQUECEDOR();
+
+                /*envia OFF Aquecedor : xQueueSend para a fila xSerial */
+                if(!xQueueSend(xControl_Serial, &"AOFF", 10))
+                {
+
+                }
+            }
+
+        //}
+
+        //if (umid != 0)
+        //{
+            if (sensorReceived.humidity < umid)
+            {
+                /*ligar GPIO umidificador*/
+                LIGA_UMIDIFICADOR();
+
+                /*envia ON Umidificador : xQueueSend para a fila xSerial */
+                if(!xQueueSend(xControl_Serial, &"UON", 10))
+                {
+
+                }
+            }
+            else if (sensorReceived.humidity > umid)
+            {
+                /*desligar GPIO umidificador*/
+                DESLIGA_UMIDIFICADOR();
+
+                /*envia OFF Umidificador : xQueueSend para a fila xSerial */
+                if(!xQueueSend(xControl_Serial, &"UOFF", 10))
+                {
+
+                }
+            }
+         //}
+    }
   }
-
 }
-
-
 
 /*===========================================================================================*/
 // Função que recebe os dados da serial USB e trata as informações de protocolo
 
-void vTaskRecSerial( void *pvParameter )
+void vTaskComSerial( void *pvParameter )
 {
 
     (void) pvParameter;
 
-    char *dadosNameTask = pcTaskGetTaskName(xTaskRecSerial);
+    char *dadosNameTask = pcTaskGetTaskName(xTaskComSerial);
     if( DEBUG )
     {
         ESP_LOGI( TAG1, "%s \n", dadosNameTask);
     }
 
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-    uart_param_config(UART_NUM_0, &uart_config);
-    uart_driver_install(UART_NUM_0, BUF_SIZE * 2, 0, 0, NULL, 0);
+    uint8_t cStatusSaidas[3];
+
+    dht_t sensorReceive;
 
     while (true)
     {
@@ -323,39 +361,29 @@ void vTaskRecSerial( void *pvParameter )
             if(strncmp((char*)cBufferRx_USB_Comp, (char*)"[SETTEMP=", strlen((char*)"[SETTEMP=")) == false)
             {
 
-                uint8_t cSetTemp[3];
+                uint8_t cSetTemp[2];
 
                 cSetTemp[0] = 'T';
-                cSetTemp[1] = cBufferRx_USB_Comp[9];
-                cSetTemp[2] = cBufferRx_USB_Comp[10];
+                cSetTemp[1] = ((cBufferRx_USB_Comp[9] - '0') * 10) + (cBufferRx_USB_Comp[10] - '0');
 
-                strcpy((char*)cBufferTx_USB, (char*)cSetTemp);
+                if(!xQueueSend(xSerial_Control, &cSetTemp, 10))
+                {
 
-                if(!xQueueSend(xSerial, &cSetTemp, 500)) {
-                  ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
                 }
-                //uart_write_bytes(UART_NUM_0, (char*)cBufferTx_USB, strlen((char*)cBufferTx_USB));
-                //uart_write_bytes(UART_NUM_0, (char*)"\r\n", strlen((char*)"\r\n"));
-
 
             }
 
             else if(strncmp((char*)cBufferRx_USB_Comp, (char*)"[SETUMID=", strlen((char*)"[SETUMID=")) == false)
             {
-                uint8_t cSetUmi[3];
+                uint8_t cSetUmi[2];
 
                 cSetUmi[0] = 'U';
-                cSetUmi[1] = cBufferRx_USB_Comp[9];
-                cSetUmi[2] = cBufferRx_USB_Comp[10];
+                cSetUmi[1] = ((cBufferRx_USB_Comp[9] - '0') * 10) + (cBufferRx_USB_Comp[10] - '0');
 
-                strcpy((char*)cBufferTx_USB, (char*)cSetUmi);
+                if(!xQueueSend(xSerial_Control, &cSetUmi, 10))
+                {
 
-                if(!xQueueSend(xSerial, &cSetUmi, 500)) {
-                  ESP_LOGI("Falha ao enviar o valor para a fila dentro de 500ms.\n");
                 }
-
-                //uart_write_bytes(UART_NUM_0, (char*)cBufferTx_USB, strlen((char*)cBufferTx_USB));
-                //uart_write_bytes(UART_NUM_0, (char*)"\r\n", strlen((char*)"\r\n"));
 
             }
 
@@ -363,7 +391,60 @@ void vTaskRecSerial( void *pvParameter )
                 memset((char*)cBufferRx_USB_Comp, '\0', strlen((char*)cBufferRx_USB_Comp));
             }
         }
-    }
+
+
+        if(!xQueueReceive(xControl_Serial, &cStatusSaidas, 10))
+        {
+
+        }
+        else
+        {
+            if(strncmp((char*)cStatusSaidas, (char*)"AON", strlen((char*)"AON")) == false)
+            {
+                xSemaphoreTake( xMutex, portMAX_DELAY );
+                uart_write_bytes(UART_NUM_0, (char*)"[AQUECEDOR=LIGADO]", strlen((char*)"[AQUECEDOR=LIGADO]"));
+                xSemaphoreGive( xMutex );
+            }
+            else if(strncmp((char*)cStatusSaidas, (char*)"AOFF", strlen((char*)"AOFF")) == false)
+            {
+                xSemaphoreTake( xMutex, portMAX_DELAY );
+                uart_write_bytes(UART_NUM_0, (char*)"[AQUECEDOR=DESLIGADO]", strlen((char*)"[AQUECEDOR=DESLIGADO]"));
+                xSemaphoreGive( xMutex );
+            }
+
+            if(strncmp((char*)cStatusSaidas, (char*)"UON", strlen((char*)"UON")) == false)
+            {
+                xSemaphoreTake( xMutex, portMAX_DELAY );
+                uart_write_bytes(UART_NUM_0, (char*)"[UMIDIFICADOR=LIGADO]", strlen((char*)"[UMIDIFICADOR=LIGADO]"));
+                xSemaphoreGive( xMutex );
+            }
+            else if(strncmp((char*)cStatusSaidas, (char*)"UOFF", strlen((char*)"UOFF")) == false)
+            {
+                xSemaphoreTake( xMutex, portMAX_DELAY );
+                uart_write_bytes(UART_NUM_0, (char*)"[UMIDIFICADOR=DESLIGADO]", strlen((char*)"[UMIDIFICADOR=DESLIGADO]"));
+                xSemaphoreGive( xMutex );
+            }
+        }
+
+        if(!xQueueReceive(xMonitor_Serial, &sensorReceive, 10))
+        {
+
+        }
+        else
+        {
+            xSemaphoreTake( xMutex, portMAX_DELAY );
+            sprintf((char*)cBufferTx_USB, "[TEMPERATURA=%d]", sensorReceive.temperature);
+            uart_write_bytes(UART_NUM_0, (char*)cBufferTx_USB, strlen((char*)cBufferTx_USB));
+            memset((char*)cBufferRx_USB_Comp, '\0', strlen((char*)cBufferRx_USB_Comp));
+
+            sprintf((char*)cBufferTx_USB, "[UMIDADE=%d]", sensorReceive.humidity);
+            uart_write_bytes(UART_NUM_0, (char*)cBufferTx_USB, strlen((char*)cBufferTx_USB));
+            memset((char*)cBufferRx_USB_Comp, '\0', strlen((char*)cBufferRx_USB_Comp));
+            xSemaphoreGive( xMutex );
+        }
+
+
+     }
 }
 
 /*===========================================================================================*/
